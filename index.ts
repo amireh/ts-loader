@@ -65,6 +65,7 @@ interface WebpackError {
     rawMessage: string;
     location?: {line: number, character: number};
     loaderSource: string;
+    loaderId: string;
 }
 
 interface ResolvedModule {
@@ -110,14 +111,16 @@ function formatErrors(diagnostics: typescript.Diagnostic[], instance: TSInstance
                     message: `${'('.white}${(lineChar.line+1).toString().cyan},${(lineChar.character+1).toString().cyan}): ${messageText.red}`,
                     rawMessage: messageText,
                     location: {line: lineChar.line+1, character: lineChar.character+1},
-                    loaderSource: 'ts-loader'
+                    loaderSource: 'ts-loader',
+                    loaderId: instance.loaderOptions.instance,
                 };
             }
             else {
                 return {
                     message:`${messageText.red}`,
                     rawMessage: messageText,
-                    loaderSource: 'ts-loader'
+                    loaderSource: 'ts-loader',
+                    loaderId: instance.loaderOptions.instance,
                 };
             }
         })
@@ -168,7 +171,8 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
         return { error: {
             message: message.red,
             rawMessage: message,
-            loaderSource: 'ts-loader'
+            loaderSource: 'ts-loader',
+            loaderId: loaderOptions.instance,
         } };
     }
 
@@ -261,15 +265,21 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
     }
 
     if (configParseResult.errors.length) {
-        pushArray(
-            loader._module.errors,
-            formatErrors(configParseResult.errors, instance, { file: configFilePath }));
+        const formattedErrors = formatErrors(configParseResult.errors, instance, { file: configFilePath });
+
+        if (loader.happypack) {
+            formattedErrors.forEach(loader.emitModuleError);
+        }
+        else {
+            pushArray(loader._module.errors, formattedErrors);
+        }
 
         return { error: {
             file: configFilePath,
             message: 'error while parsing tsconfig.json'.red,
             rawMessage: 'error while parsing tsconfig.json',
-            loaderSource: 'ts-loader'
+            loaderSource: 'ts-loader',
+            loaderId: loaderOptions.instance,
         }};
     }
 
@@ -314,7 +324,8 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
         return { error: {
             message: filePathError.red,
             rawMessage: filePathError,
-            loaderSource: 'ts-loader'
+            loaderSource: 'ts-loader',
+            loaderId: loaderOptions.instance,
         }};
     }
 
@@ -397,9 +408,9 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
 
                 resolvedModules.push(resolutionResult);
             }
-            
+
             instance.dependencyGraph[containingFile] = resolvedModules.filter(m => m != null).map(m => m.resolvedFileName);
-            
+
             return resolvedModules;
         }
     };
@@ -409,13 +420,36 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
     var getCompilerOptionDiagnostics = true;
 
     loader._compiler.plugin("after-compile", (compilation, callback) => {
+        // yuck err eww blugh hmph
+        //
+        // we really really only need to run this from any loader instance and
+        // not all of them since the reports are throughout the whole program
+        // and not necessarily the files that _this_ loader instance has
+        // handled!
+        if (compilation.happypack) {
+            let lastCompilation;
+
+            try {
+               lastCompilation = JSON.parse(fs.readFileSync('./ts-loader__state.json', 'utf-8')).compilationId;
+            } catch(e) {}
+
+            if (lastCompilation === compilation.id) {
+                return callback();
+            }
+
+            fs.writeFileSync('./ts-loader__state.json', JSON.stringify({
+                compilationId: compilation.id
+            }), 'utf-8');
+        }
+
+
         // Don't add errors for child compilations
         if (compilation.compiler.isChild()) {
             callback();
             return;
         }
-        
-        let stats = compilation.stats;
+
+        console.log('ts-loader[%s] applying "after-compile" for compilation#%s', loaderOptions.instance, compilation.id);
 
         // handle all other errors. The basic approach here to get accurate error
         // reporting is to start with a "blank slate" each compilation and gather
@@ -433,14 +467,28 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
             }
         }
 
-        removeTSLoaderErrors(compilation.errors);
+        if (compilation.happypack) {
+            compilation.purgeErrors({
+                loaderSource: 'ts-loader',
+                loaderId: loaderOptions.instance
+            });
+        }
+        else {
+            removeTSLoaderErrors(compilation.errors);
+        }
 
         // handle compiler option errors after the first compile
         if (getCompilerOptionDiagnostics) {
             getCompilerOptionDiagnostics = false;
-            pushArray(
-                compilation.errors,
-                formatErrors(languageService.getCompilerOptionsDiagnostics(), instance, {file: configFilePath || 'tsconfig.json'}));
+
+            const formattedErrors = formatErrors(languageService.getCompilerOptionsDiagnostics(), instance, {file: configFilePath || 'tsconfig.json'});
+
+            if (compilation.happypack) {
+                formattedErrors.forEach(compilation.addError);
+            }
+            else {
+                pushArray(compilation.errors, formattedErrors);
+            }
         }
 
         // build map of all modules based on normalized filename
@@ -473,18 +521,39 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
                     let associatedModules = modules[filePath];
 
                     associatedModules.forEach(module => {
-                        // remove any existing errors
-                        removeTSLoaderErrors(module.errors);
-
                         // append errors
                         let formattedErrors = formatErrors(errors, instance, { module });
-                        pushArray(module.errors, formattedErrors);
-                        pushArray(compilation.errors, formattedErrors);
+
+                        if (compilation.happypack) {
+                            compilation.purgeModuleErrors(module, {
+                                loaderSource: 'ts-loader',
+                                loaderId: loaderOptions.instance,
+                            });
+
+                            formattedErrors.forEach(function(error) {
+                                compilation.addModuleError(error, module);
+                                compilation.addError(error);
+                            });
+                        }
+                        else {
+                            // remove any existing errors
+                            removeTSLoaderErrors(module.errors);
+
+                            pushArray(module.errors, formattedErrors);
+                            pushArray(compilation.errors, formattedErrors);
+                        }
                     })
                 }
                 // otherwise it's a more generic error
                 else {
-                    pushArray(compilation.errors, formatErrors(errors, instance, {file: filePath}));
+                    const formattedErrors = formatErrors(errors, instance, {file: filePath});
+
+                    if (compilation.happypack) {
+                        formattedErrors.forEach(compilation.addError);
+                    }
+                    else {
+                        pushArray(compilation.errors, formattedErrors);
+                    }
                 }
             });
 
@@ -508,7 +577,11 @@ function ensureTypeScriptInstance(loaderOptions: LoaderOptions, loader: any): { 
 
     // manually update changed files
     loader._compiler.plugin("watch-run", (watching, cb) => {
-        var mtimes = watching.compiler.watchFileSystem.watcher.mtimes;
+        let mtimes = watching.happypack ?
+            watching.mtimes :
+            watching.compiler.watchFileSystem.watcher.mtimes
+        ;
+
         Object.keys(mtimes)
             .filter(filePath => !!filePath.match(/\.tsx?$|\.jsx?$/))
             .forEach(filePath => {
@@ -545,7 +618,7 @@ function loader(contents) {
     options.ignoreDiagnostics = arrify(options.ignoreDiagnostics).map(Number);
 
     // differentiate the TypeScript instance based on the webpack instance
-    var webpackIndex = webpackInstances.indexOf(this._compiler);
+    var webpackIndex = this._compiler._id || webpackInstances.indexOf(this._compiler);
     if (webpackIndex == -1) {
         webpackIndex = webpackInstances.push(this._compiler)-1;
     }
@@ -589,7 +662,7 @@ function loader(contents) {
 
         // Emit Javascript
         var output = langService.getEmitOutput(filePath);
-        
+
         // Make this file dependent on *all* definition files in the program
         this.clearDependencies();
         this.addDependency(filePath);
@@ -600,12 +673,19 @@ function loader(contents) {
         // Additionally make this file dependent on all imported files
         let additionalDependencies = instance.dependencyGraph[filePath];
         if (additionalDependencies) {
-            additionalDependencies.forEach(this.addDependency.bind(this))  
+            additionalDependencies.forEach(this.addDependency.bind(this))
         }
-        
-        this._module.meta.tsLoaderDefinitionFileVersions = allDefinitionFiles
+
+        const definitionFileVersions = allDefinitionFiles
             .concat(additionalDependencies)
             .map(filePath => filePath+'@'+(instance.files[filePath] || {version: '?'}).version);
+
+        if (this.happypack) {
+            this.writeModuleMetaAttribute('tsLoaderDefinitionFileVersions', definitionFileVersions);
+        }
+        else {
+            this._module.meta.tsLoaderDefinitionFileVersions = definitionFileVersions;
+        }
 
         var outputFile = output.outputFiles.filter(file => !!file.name.match(/\.js(x?)$/)).pop();
         if (outputFile) { outputText = outputFile.text }
@@ -627,7 +707,12 @@ function loader(contents) {
     // Make sure webpack is aware that even though the emitted JavaScript may be the same as
     // a previously cached version the TypeScript may be different and therefore should be
     // treated as new
-    this._module.meta.tsLoaderFileVersion = file.version;
+    if (this.happypack) {
+        this.writeModuleMetaAttribute('tsLoaderFileVersion', file.version);
+    }
+    else {
+        this._module.meta.tsLoaderFileVersion = file.version;
+    }
 
     callback(null, outputText, sourceMap)
 }
